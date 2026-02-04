@@ -24,7 +24,6 @@ class Inputs:
     hourly_rate: float
     annual_salary: float
     hours_per_week: float
-    pay_periods_per_year: int  # 12 monthly, 26 biweekly, 52 weekly, 24 semimonthly
 
     # Expenses (monthly)
     rent: float
@@ -40,11 +39,14 @@ class Inputs:
     entertainment: float
     other_wants: float
 
+    # Goal (optional)
+    goal_name: str
+    goal_cost: float
+
 
 def effective_hourly_rate(i: Inputs) -> float:
     if i.pay_type == "Hourly":
         return max(i.hourly_rate, 0.01)
-    # Convert salary to hourly using user-entered hours/week
     annual_hours = max(i.hours_per_week, 0.01) * 52.0
     return max(i.annual_salary / annual_hours, 0.01)
 
@@ -57,7 +59,6 @@ def monthly_income(i: Inputs) -> float:
 
 
 def monthly_work_hours(i: Inputs) -> float:
-    # Use actual hours/week as the base "time budget" for income
     return i.hours_per_week * 52.0 / 12.0
 
 
@@ -101,15 +102,44 @@ def build_breakdown_df(i: Inputs) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def top_time_drains(df: pd.DataFrame, n: int = 3) -> pd.DataFrame:
+    out = df.sort_values("Hours of work", ascending=False).head(n).copy()
+    out = out[["Group", "Category", "Monthly $", "Hours of work"]]
+    out["Monthly $"] = out["Monthly $"].round(0)
+    out["Hours of work"] = out["Hours of work"].round(1)
+    return out
+
+
+def goal_metrics(i: Inputs) -> Dict[str, float]:
+    hr = effective_hourly_rate(i)
+    base = sums(i)
+    leftover = base["leftover"]
+    goal_cost = max(i.goal_cost, 0.0)
+
+    goal_hours = hours_equivalent(goal_cost, hr)
+    # If leftover is <= 0, you cannot fund goal from leftover
+    if leftover > 0:
+        months_to_goal = goal_cost / leftover
+        weeks_to_goal = months_to_goal * (52.0 / 12.0)
+    else:
+        months_to_goal = float("inf")
+        weeks_to_goal = float("inf")
+
+    return {
+        "goal_hours": goal_hours,
+        "months_to_goal": months_to_goal,
+        "weeks_to_goal": weeks_to_goal,
+        "leftover": leftover,
+    }
+
+
 # ----------------------------
 # Scenario generation (deterministic)
 # ----------------------------
 
 def propose_scenarios(i: Inputs) -> List[Dict[str, Any]]:
     s = sums(i)
-    inc = s["income"]
 
-    # Identify top wants line item
     wants_map = {
         "Dining": i.dining,
         "Subscriptions": i.subscriptions,
@@ -121,32 +151,38 @@ def propose_scenarios(i: Inputs) -> List[Dict[str, Any]]:
 
     scenarios = []
 
-    # 1) Cut top want by 25%
+    if s["leftover"] < 0:
+        scenarios.append(
+            {
+                "title": "Stabilize: cut total wants by 15%",
+                "changes": {"cut_total_wants_pct": 0.15},
+                "why": "Spending exceeds income; prioritize bringing the month back within budget.",
+            }
+        )
+
     if top_want_amt > 0:
         scenarios.append(
             {
                 "title": f"Reduce {top_want} by 25%",
                 "changes": {"cut_wants": {top_want: 0.25}},
-                "why": "Targets the highest discretionary line item for maximum impact with minimal complexity.",
+                "why": "Targets the highest discretionary line item for the largest time savings.",
             }
         )
 
-    # 2) Add 2 hours/week work
     scenarios.append(
         {
             "title": "Add 2 work hours per week",
             "changes": {"add_hours_per_week": 2.0},
-            "why": "Increases capacity without changing expenses, useful when essentials consume most income.",
+            "why": "Increases monthly capacity without changing expenses.",
         }
     )
 
-    # 3) Cancel or reduce subscriptions by $15 if meaningful
     if i.subscriptions >= 15:
         scenarios.append(
             {
                 "title": "Trim subscriptions by $15 per month",
                 "changes": {"set_subscriptions_delta": -15.0},
-                "why": "Low friction change that improves cash flow immediately.",
+                "why": "Low friction reduction that improves cash flow immediately.",
             }
         )
     else:
@@ -154,22 +190,10 @@ def propose_scenarios(i: Inputs) -> List[Dict[str, Any]]:
             {
                 "title": "Reduce dining by $25 per month",
                 "changes": {"set_dining_delta": -25.0},
-                "why": "Small recurring reduction that adds up without changing necessities.",
+                "why": "Small recurring reduction that adds up without touching necessities.",
             }
         )
 
-    # If income is negative leftover, add a stabilizing scenario
-    if s["leftover"] < 0:
-        scenarios.insert(
-            0,
-            {
-                "title": "Stabilize: cut total wants by 15%",
-                "changes": {"cut_total_wants_pct": 0.15},
-                "why": "Brings spending back within income when the current month runs a deficit.",
-            },
-        )
-
-    # Keep top 3
     return scenarios[:3]
 
 
@@ -177,11 +201,9 @@ def apply_scenario(i: Inputs, scenario: Dict[str, Any]) -> Inputs:
     j = Inputs(**asdict(i))
     ch = scenario.get("changes", {})
 
-    # Add work hours
     if "add_hours_per_week" in ch:
         j.hours_per_week = max(0.0, j.hours_per_week + float(ch["add_hours_per_week"]))
 
-    # Cut total wants by percent
     if "cut_total_wants_pct" in ch:
         pct = float(ch["cut_total_wants_pct"])
         j.dining *= (1 - pct)
@@ -189,7 +211,6 @@ def apply_scenario(i: Inputs, scenario: Dict[str, Any]) -> Inputs:
         j.entertainment *= (1 - pct)
         j.other_wants *= (1 - pct)
 
-    # Cut specific want by percent
     if "cut_wants" in ch:
         for k, pct in ch["cut_wants"].items():
             pct = float(pct)
@@ -202,7 +223,6 @@ def apply_scenario(i: Inputs, scenario: Dict[str, Any]) -> Inputs:
             elif k == "Other wants":
                 j.other_wants *= (1 - pct)
 
-    # Direct deltas
     if "set_subscriptions_delta" in ch:
         j.subscriptions = max(0.0, j.subscriptions + float(ch["set_subscriptions_delta"]))
     if "set_dining_delta" in ch:
@@ -216,19 +236,18 @@ def apply_scenario(i: Inputs, scenario: Dict[str, Any]) -> Inputs:
 # ----------------------------
 
 def ai_insights(i: Inputs, scenarios: List[Dict[str, Any]], model: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Returns (analysis_text, scenarios_out)
-    scenarios_out optionally enhanced by the model, but always usable.
-    """
-    # Fallback text
     base = sums(i)
     hr = effective_hourly_rate(i)
+    df = build_breakdown_df(i)
+    top3 = top_time_drains(df, n=3)
 
     fallback_lines = [
         f"Effective hourly rate: ${hr:,.2f}. Estimated monthly income: ${base['income']:,.0f}.",
         f"Needs: ${base['needs']:,.0f} ({(base['needs']/base['income']*100) if base['income']>0 else 0:,.0f}%). "
         f"Wants: ${base['wants']:,.0f} ({(base['wants']/base['income']*100) if base['income']>0 else 0:,.0f}%).",
-        f"Leftover: ${base['leftover']:,.0f}. Opportunity cost framing: ${base['wants']:,.0f} of wants equals {hours_equivalent(base['wants'], hr):,.1f} work-hours per month.",
+        f"Leftover: ${base['leftover']:,.0f}. Wants represent {hours_equivalent(base['wants'], hr):,.1f} work-hours per month.",
+        "Top time drains (by hours): "
+        + ", ".join([f"{r['Category']} ({r['Hours of work']:.1f}h)" for _, r in top3.iterrows()]),
     ]
     fallback_text = "\n".join(fallback_lines)
 
@@ -239,21 +258,21 @@ def ai_insights(i: Inputs, scenarios: List[Dict[str, Any]], model: str) -> Tuple
     try:
         client = OpenAI()
 
-        # Ask for short, analytical output, and a JSON scenario ranking
         prompt = {
             "role": "user",
             "content": (
-                "You are a concise, analytical personal finance analyst. "
-                "Given the user's monthly income and expense breakdown, write:\n"
-                "1) A 4 to 6 sentence analytical summary focusing on opportunity cost in time terms.\n"
-                "2) Rank the provided scenarios from best to worst and add a one-sentence rationale for each.\n"
-                "Return JSON with keys: summary (string), ranked_scenarios (array of objects with title and rationale).\n\n"
-                f"Inputs (monthly): {json.dumps({'income': base['income'], 'needs': base['needs'], 'wants': base['wants'], 'leftover': base['leftover'], 'effective_hourly_rate': hr}, indent=2)}\n"
+                "You are a concise, analytical personal finance analyst.\n"
+                "Return JSON only.\n\n"
+                "Write:\n"
+                "1) summary: 4 to 6 sentences focusing on opportunity cost in time terms.\n"
+                "2) top_time_drains: 3 bullets (short phrases) explaining why the top categories matter.\n"
+                "3) ranked_scenarios: rank provided scenarios best to worst with one-sentence rationale each.\n\n"
+                f"Monthly snapshot: {json.dumps({'income': base['income'], 'needs': base['needs'], 'wants': base['wants'], 'leftover': base['leftover'], 'effective_hourly_rate': hr}, indent=2)}\n"
+                f"Top categories by hours: {json.dumps(top3.to_dict(orient='records'), indent=2)}\n"
                 f"Scenarios: {json.dumps([{'title': s['title'], 'why': s['why'], 'changes': s['changes']} for s in scenarios], indent=2)}\n"
             ),
         }
 
-        # Use Responses API (recommended in OpenAI docs) and read output_text
         resp = client.responses.create(
             model=model,
             input=[prompt],
@@ -264,7 +283,6 @@ def ai_insights(i: Inputs, scenarios: List[Dict[str, Any]], model: str) -> Tuple
         summary = str(data.get("summary", "")).strip() or fallback_text
         ranked = data.get("ranked_scenarios", [])
 
-        # Merge rationales back onto our scenarios by title
         rationale_map = {}
         if isinstance(ranked, list):
             for r in ranked:
@@ -278,6 +296,13 @@ def ai_insights(i: Inputs, scenarios: List[Dict[str, Any]], model: str) -> Tuple
                 s2["ai_rationale"] = rationale_map[s2["title"]]
             out.append(s2)
 
+        # Attach AI top time drain bullets for display via session_state
+        bullets = data.get("top_time_drains", [])
+        if isinstance(bullets, list):
+            st.session_state["ai_time_drain_bullets"] = [str(b).strip() for b in bullets if str(b).strip()]
+        else:
+            st.session_state["ai_time_drain_bullets"] = []
+
         return summary, out
 
     except Exception:
@@ -289,7 +314,6 @@ def ai_insights(i: Inputs, scenarios: List[Dict[str, Any]], model: str) -> Tuple
 # ----------------------------
 
 st.set_page_config(page_title="Opportunity Cost Visualizer", layout="wide")
-
 st.title("Opportunity Cost Visualizer")
 st.caption("Visualize income as time, then use AI-generated hypotheticals to reduce high-cost spending patterns.")
 
@@ -305,11 +329,11 @@ with st.sidebar:
         annual_salary = st.number_input("Annual salary ($)", min_value=0.0, value=55000.0, step=500.0)
         hourly_rate = 0.0
 
-    hours_per_week = st.number_input("Actual hours worked per week", min_value=0.0, value=40.0, step=1.0)
+    hours_per_week = st.number_input("Actual hours worked per week", min_value=0.0, value=34.0, step=1.0)
 
     st.divider()
     st.subheader("Monthly necessities")
-    rent = st.number_input("Rent / mortgage", min_value=0.0, value=1400.0, step=25.0)
+    rent = st.number_input("Rent / mortgage", min_value=0.0, value=550.0, step=25.0)
     utilities = st.number_input("Utilities", min_value=0.0, value=180.0, step=10.0)
     groceries = st.number_input("Groceries", min_value=0.0, value=400.0, step=10.0)
     transport = st.number_input("Transportation", min_value=0.0, value=220.0, step=10.0)
@@ -324,9 +348,14 @@ with st.sidebar:
     other_wants = st.number_input("Other wants", min_value=0.0, value=80.0, step=5.0)
 
     st.divider()
+    st.subheader("Goal mode")
+    goal_name = st.text_input("Goal name", value="New laptop")
+    goal_cost = st.number_input("Goal cost ($)", min_value=0.0, value=900.0, step=25.0)
+
+    st.divider()
     st.subheader("AI settings")
     model = st.text_input("OpenAI model", value="gpt-5.2")
-    st.caption("If OPENAI_API_KEY is not set, the app uses a built-in analytical fallback.")
+    st.caption("If OPENAI_API_KEY is not set, the app uses an analytical fallback.")
 
 
 inputs = Inputs(
@@ -334,7 +363,6 @@ inputs = Inputs(
     hourly_rate=float(hourly_rate),
     annual_salary=float(annual_salary),
     hours_per_week=float(hours_per_week),
-    pay_periods_per_year=12,
     rent=float(rent),
     utilities=float(utilities),
     groceries=float(groceries),
@@ -345,93 +373,120 @@ inputs = Inputs(
     subscriptions=float(subscriptions),
     entertainment=float(entertainment),
     other_wants=float(other_wants),
+    goal_name=str(goal_name),
+    goal_cost=float(goal_cost),
 )
 
 base = sums(inputs)
 hr = effective_hourly_rate(inputs)
 work_hours = monthly_work_hours(inputs)
+df = build_breakdown_df(inputs)
+top3 = top_time_drains(df, n=3)
 
 scenarios = propose_scenarios(inputs)
 analysis_text, scenarios_out = ai_insights(inputs, scenarios, model=model)
+ai_bullets = st.session_state.get("ai_time_drain_bullets", [])
 
-# Layout
-left, mid, right = st.columns([1.2, 1.6, 1.2], gap="large")
+tab_dash, tab_insights, tab_scenarios = st.tabs(["Dashboard", "Insights", "Scenarios"])
 
-with left:
-    st.subheader("Key metrics")
-    st.metric("Monthly income (estimated)", f"${base['income']:,.0f}")
-    st.metric("Effective hourly rate", f"${hr:,.2f}")
-    st.metric("Monthly work hours", f"{work_hours:,.1f} hrs")
-    st.metric("Leftover after needs + wants", f"${base['leftover']:,.0f}")
+with tab_dash:
+    left, mid, right = st.columns([1.2, 1.6, 1.2], gap="large")
 
-    st.subheader("Opportunity cost view")
-    wants_hours = hours_equivalent(base["wants"], hr)
-    needs_hours = hours_equivalent(base["needs"], hr)
-    st.write(f"Needs consume about **{needs_hours:,.1f}** work-hours per month.")
-    st.write(f"Wants consume about **{wants_hours:,.1f}** work-hours per month.")
+    with left:
+        st.subheader("Key metrics")
+        st.metric("Monthly income (estimated)", f"${base['income']:,.0f}")
+        st.metric("Effective hourly rate", f"${hr:,.2f}")
+        st.metric("Monthly work hours", f"{work_hours:,.1f} hrs")
+        st.metric("Leftover after needs + wants", f"${base['leftover']:,.0f}")
 
-with mid:
-    st.subheader("Time budget breakdown")
+        st.subheader("Goal mode")
+        gm = goal_metrics(inputs)
+        st.write(f"Goal: **{inputs.goal_name}** (${inputs.goal_cost:,.0f})")
+        st.write(f"Time cost: **{gm['goal_hours']:.1f} hours** of work")
 
-    # Build chart data
-    chart_df = pd.DataFrame(
-        [
-            {"Bucket": "Needs", "Hours": float(hours_equivalent(base["needs"], hr))},
-            {"Bucket": "Wants", "Hours": float(hours_equivalent(base["wants"], hr))},
-            {"Bucket": "Unallocated", "Hours": float(max(0.0, work_hours - hours_equivalent(base["needs"] + base["wants"], hr)))},
-        ]
-    )
+        if gm["weeks_to_goal"] != float("inf"):
+            st.write(f"Estimated time to goal (using leftover): **{gm['weeks_to_goal']:.1f} weeks**")
+        else:
+            st.warning("Leftover is not positive, so the goal cannot be funded from current leftover.")
 
-    chart = (
-        alt.Chart(chart_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("Hours:Q", title="Hours of work per month"),
-            y=alt.Y("Bucket:N", title=""),
-            tooltip=["Bucket", alt.Tooltip("Hours:Q", format=",.1f")],
+    with mid:
+        st.subheader("Time budget breakdown")
+
+        chart_df = pd.DataFrame(
+            [
+                {"Bucket": "Needs", "Hours": float(hours_equivalent(base["needs"], hr))},
+                {"Bucket": "Wants", "Hours": float(hours_equivalent(base["wants"], hr))},
+                {"Bucket": "Unallocated", "Hours": float(max(0.0, work_hours - hours_equivalent(base["needs"] + base["wants"], hr)))},
+            ]
         )
-        .properties(height=180)
-    )
-    st.altair_chart(chart, use_container_width=True)
 
-    st.subheader("Detailed categories")
-    df = build_breakdown_df(inputs)
-    df_show = df[["Group", "Category", "Monthly $", "Hours of work", "Share of income"]].copy()
-    df_show["Share of income"] = (df_show["Share of income"] * 100).round(1).astype(str) + "%"
-    st.dataframe(df_show, use_container_width=True, hide_index=True)
+        chart = (
+            alt.Chart(chart_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("Hours:Q", title="Hours of work per month"),
+                y=alt.Y("Bucket:N", title=""),
+                tooltip=["Bucket", alt.Tooltip("Hours:Q", format=",.1f")],
+            )
+            .properties(height=180)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
-with right:
-    st.subheader("AI insights")
-    st.text_area("Summary", analysis_text, height=180)
+        st.subheader("Top time drains")
+        st.dataframe(top3, use_container_width=True, hide_index=True)
 
+    with right:
+        st.subheader("AI insights (summary)")
+        st.text_area("Summary", analysis_text, height=220)
+
+with tab_insights:
+    col1, col2 = st.columns([1.3, 1.7], gap="large")
+
+    with col1:
+        st.subheader("AI: why the top categories matter")
+        if ai_bullets:
+            for b in ai_bullets[:3]:
+                st.write(f"- {b}")
+        else:
+            st.write("- High-hour categories represent the biggest opportunity cost drivers.")
+            st.write("- Small reductions here typically produce the largest time savings.")
+            st.write("- These are the best first targets before optimizing smaller items.")
+
+        st.subheader("Opportunity cost view")
+        needs_hours = hours_equivalent(base["needs"], hr)
+        wants_hours = hours_equivalent(base["wants"], hr)
+        st.write(f"Needs consume about **{needs_hours:,.1f}** work-hours per month.")
+        st.write(f"Wants consume about **{wants_hours:,.1f}** work-hours per month.")
+
+    with col2:
+        st.subheader("Detailed categories")
+        df_show = df[["Group", "Category", "Monthly $", "Hours of work", "Share of income"]].copy()
+        df_show["Share of income"] = (df_show["Share of income"] * 100).round(1).astype(str) + "%"
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+with tab_scenarios:
     st.subheader("Suggested hypotheticals")
-    st.caption("Click a scenario to see the time-based opportunity cost change.")
+    st.caption("Select a scenario to compare it against your baseline.")
 
-    # Scenario selection
     titles = [s["title"] for s in scenarios_out]
-    choice = st.radio("Scenarios", titles, index=0)
+    choice = st.radio("Scenarios", titles, index=0, horizontal=False)
 
     picked = next(s for s in scenarios_out if s["title"] == choice)
     updated_inputs = apply_scenario(inputs, picked)
     updated = sums(updated_inputs)
     updated_hr = effective_hourly_rate(updated_inputs)
-    updated_work_hours = monthly_work_hours(updated_inputs)
 
-    # Scenario impact
     delta_leftover = updated["leftover"] - base["leftover"]
     delta_wants_hours = hours_equivalent(updated["wants"], updated_hr) - hours_equivalent(base["wants"], hr)
 
-    st.metric("Leftover change", f"${delta_leftover:,.0f}")
-    st.metric("Wants time change", f"{delta_wants_hours:,.1f} hrs")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Leftover change", f"${delta_leftover:,.0f}")
+    c2.metric("Wants time change", f"{delta_wants_hours:,.1f} hrs")
+    c3.metric("Adjusted monthly income", f"${updated['income']:,.0f}")
 
-    if picked.get("ai_rationale"):
-        st.write("**Rationale**")
-        st.write(picked["ai_rationale"])
-    else:
-        st.write("**Rationale**")
-        st.write(picked.get("why", "Scenario rationale unavailable."))
+    st.subheader("Rationale")
+    st.write(picked.get("ai_rationale") or picked.get("why") or "Scenario rationale unavailable.")
 
-    # Small comparison bar
     comp_df = pd.DataFrame(
         [
             {"Scenario": "Base", "Needs (hrs)": hours_equivalent(base["needs"], hr), "Wants (hrs)": hours_equivalent(base["wants"], hr)},
@@ -448,6 +503,7 @@ with right:
             color=alt.Color("Bucket:N", legend=alt.Legend(title="")),
             tooltip=["Scenario", "Bucket", alt.Tooltip("Hours:Q", format=",.1f")],
         )
-        .properties(height=160)
+        .properties(height=200)
     )
     st.altair_chart(comp_chart, use_container_width=True)
+
